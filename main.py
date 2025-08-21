@@ -1,12 +1,10 @@
-from fastapi import FastAPI, Request, Depends, status, HTTPException, UploadFile, File
+from fastapi import FastAPI, Request, Depends, status, HTTPException, UploadFile, File, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
-
 
 from starlette.responses import StreamingResponse, Response
 from pydantic import BaseModel, ConfigDict
 from typing import List, Union, Generator, Iterator
-
 
 from utils.pipelines.auth import bearer_security, get_current_user
 from utils.pipelines.main import get_last_user_message, stream_message_template
@@ -28,12 +26,10 @@ import uuid
 import sys
 import subprocess
 
-
 from config import API_KEY, PIPELINES_DIR, LOG_LEVELS
 
 if not os.path.exists(PIPELINES_DIR):
     os.makedirs(PIPELINES_DIR)
-
 
 PIPELINES = {}
 PIPELINE_MODULES = {}
@@ -256,11 +252,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(docs_url="/docs", redoc_url=None, lifespan=lifespan)
 
+# Added: simple health route for liveness
+@app.get("/health")
+async def health():
+    return {"status": "ok", "name": "Open WebUI Pipelines"}
+
 app.state.PIPELINES = PIPELINES
 
-
 origins = ["*"]
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -787,3 +786,33 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
                 }
 
     return await run_in_threadpool(job)
+
+
+# Added: minimal dispatcher to call a pipeline directly by ID
+@app.post("/pipelines/{pipeline_id}")
+async def run_pipeline(
+    pipeline_id: str,
+    form_data: dict = Body(...),
+    user: str = Depends(get_current_user),
+):
+    if user != API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key",
+        )
+
+    if pipeline_id not in PIPELINE_MODULES:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Pipeline {pipeline_id} not found",
+        )
+
+    pipe = PIPELINE_MODULES[pipeline_id].pipe
+    res = pipe(user_message=None, model_id=pipeline_id, messages=[], body=form_data)
+
+    if isinstance(res, dict):
+        return res
+    elif isinstance(res, BaseModel):
+        return res.model_dump()
+    else:
+        return {"result": res}
