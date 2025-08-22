@@ -141,7 +141,7 @@ except Exception:
 # -------------------------------------------------------------------
 
 APP_NAME = "Open WebUI MCPO"
-APP_VERSION = "0.0.35aa"
+APP_VERSION = "0.0.35ac"
 APP_DESCRIPTION = "Automatically generated API from MCP Tool Schemas"
 
 DEFAULT_PORT = int(os.getenv("PORT", "8080"))
@@ -272,7 +272,7 @@ def create_app() -> FastAPI:
         logger.warning("MCP library not available; skipping /tools endpoints")
     else:
         # If the MCP setup exists in this version, it should be placed here.
-        # In 35aa, the explicit setup body is not present; leaving guarded placeholder.
+        # In 35ac, the explicit setup body is not present; leaving guarded placeholder.
         try:
             # Example (when present):
             # client_context = _connector_wrapper(MCP_SERVER_URL)
