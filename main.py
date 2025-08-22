@@ -1,5 +1,5 @@
 """
-Open WebUI MCPO - main.py v0.0.35aa (reconciled to v0.0.29 entrypoint)
+Open WebUI MCPO - main.py v0.0.35ab (reconciled to v0.0.29 entrypoint)
 
 Purpose:
 - Generate RESTful endpoints from MCP Tool Schemas using the Streamable HTTP MCP client.
@@ -24,13 +24,19 @@ from contextlib import asynccontextmanager
 from importlib import import_module
 
 from fastapi import FastAPI, Depends, HTTPException
+
+# MCP optional import guard
+_MCP_AVAILABLE = True
+try:
+    from mcp.client.session import ClientSession
+    from mcp.shared.exceptions import McpError
+except Exception:
+    _MCP_AVAILABLE = False
+
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pydantic_core import ValidationError as PydValidationError
 from starlette.responses import JSONResponse
-
-from mcp.client.session import ClientSession
-from mcp.shared.exceptions import McpError
 
 
 # -------------------------------------------------------------------
@@ -255,8 +261,20 @@ def create_app() -> FastAPI:
         logger.info("Echo/Ping routes registered")
         logger.info("Configuring for a single StreamableHTTP MCP Server with URL [%s;]", MCP_SERVER_URL)
 
-        # [ .. existing MCP tool discovery logic continues .. ]
-
+        # Tools (MCPO/MCP) setup is optional; only proceed if library is present
+    if not _MCP_AVAILABLE:
+        logger.warning("MCP library not available; skipping /tools endpoints")
+    else:
+        # If the MCP setup exists in this version, it should be placed here.
+        # In 35aa, the explicit setup body is not present; leaving guarded placeholder.
+        try:
+            # Example (when present):
+            # client_context = _connector_wrapper(MCP_SERVER_URL)
+            # await setup_tools()
+            logger.info("MCP available, but no /tools discovery block present in this file; skipping")
+        except Exception:
+            logger.exception("Error during startup tool discovery/mount")
+			
     @app.get("/")
     async def root():
         return {
@@ -288,18 +306,12 @@ def attach_mcpo_diagnostics(app: FastAPI) -> None:
         }
 
 
-attach_mcpo_diagnostics(app)
-
-
 def attach_tools_listing(app: FastAPI) -> None:
     route = f"{PATH_PREFIX.rstrip('/')}/_tools" if PATH_PREFIX != "/" else "/_tools"
 
     @app.get(route)
     async def _tools(dep=Depends(api_dependency())):
         return {"tools": list(_DISCOVERED_TOOL_NAMES)}
-
-
-attach_tools_listing(app)
 
 
 def attach_tools_full_listing(app: FastAPI) -> None:
@@ -310,7 +322,19 @@ def attach_tools_full_listing(app: FastAPI) -> None:
         return {"tools": [dict(item) for item in _DISCOVERED_TOOLS_MIN]}
 
 
-attach_tools_full_listing(app)
+if _MCP_AVAILABLE:
+    attach_mcpo_diagnostics(app)
+    attach_tools_listing(app)
+    attach_tools_full_listing(app)
+else:
+    # Minimal diagnostic to confirm tools are disabled while MCP not installed
+    route = f"{PATH_PREFIX.rstrip('/')}/_diagnostic" if PATH_PREFIX != "/" else "/_diagnostic"
+    @app.get(route)
+    async def _diagnostic_pipelines_only(dep=Depends(api_dependency())):
+        return {
+            "app": {"name": APP_NAME, "version": APP_VERSION, "path_prefix": PATH_PREFIX},
+            "mcp": {"available": False, "reason": "mcp library not installed"},
+        }
 
 
 # -------------------------------------------------------------------
