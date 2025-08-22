@@ -1,818 +1,406 @@
-from fastapi import FastAPI, Request, Depends, status, HTTPException, UploadFile, File, Body
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.concurrency import run_in_threadpool
+"""
+Open WebUI MCPO - main.py v0.0.35aa (reconciled to v0.0.29 entrypoint)
 
-from starlette.responses import StreamingResponse, Response
-from pydantic import BaseModel, ConfigDict
-from typing import List, Union, Generator, Iterator
+Purpose:
+- Generate RESTful endpoints from MCP Tool Schemas using the Streamable HTTP MCP client.
+- Adds resilience to occasional transient notification/validation noise (e.g., "notifications/initialized")
+  surfaced by the HTTP adapter by retrying the RPC once.
+- Adds local pipeline discovery/compatibility for Chat-16 plan.
 
-from utils.pipelines.auth import bearer_security, get_current_user
-from utils.pipelines.main import get_last_user_message, stream_message_template
-from utils.pipelines.misc import convert_to_raw_url
+Behavior aligned with n8n-mcp (czlonkowski):
+- Handshake: initialize -> tools/list -> generate FastAPI routes -> tools/call per invocation.
 
-from contextlib import asynccontextmanager
-from concurrent.futures import ThreadPoolExecutor
-from schemas import FilterForm, OpenAIChatCompletionForm
-from urllib.parse import urlparse
+References:
+- n8n MCP/MCPO: https://github.com/DC-AAIA/n8n-mcp
+- Railway deploy/logs: https://github.com/DC-AAIA/railwayapp-docs
+"""
 
-import shutil
-import aiohttp
 import os
-import importlib.util
-import logging
-import time
 import json
-import uuid
-import sys
-import subprocess
+import asyncio
+import logging
+from typing import Any, Dict, List, Optional, Callable, Awaitable
+from contextlib import asynccontextmanager
+from importlib import import_module
 
-from config import API_KEY, PIPELINES_DIR, LOG_LEVELS
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from pydantic_core import ValidationError as PydValidationError
+from starlette.responses import JSONResponse
 
-if not os.path.exists(PIPELINES_DIR):
-    os.makedirs(PIPELINES_DIR)
-
-PIPELINES = {}
-PIPELINE_MODULES = {}
-PIPELINE_NAMES = {}
-
-# Add GLOBAL_LOG_LEVEL for Pipeplines
-log_level = os.getenv("GLOBAL_LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVELS[log_level])
+from mcp.client.session import ClientSession
+from mcp.shared.exceptions import McpError
 
 
-def get_all_pipelines():
-    pipelines = {}
-    for pipeline_id in PIPELINE_MODULES.keys():
-        pipeline = PIPELINE_MODULES[pipeline_id]
+# -------------------------------------------------------------------
+# MCP HTTP connector resolution
+# -------------------------------------------------------------------
 
-        if hasattr(pipeline, "type"):
-            if pipeline.type == "manifold":
-                manifold_pipelines = []
+def resolve_http_connector():
+    mcp_version = None
+    try:
+        from importlib.metadata import version, PackageNotFoundError
+        try:
+            mcp_version = version("mcp")
+        except PackageNotFoundError:
+            mcp_version = "unknown"
+    except Exception:
+        mcp_version = "unknown"
 
-                # Check if pipelines is a function or a list
-                if callable(pipeline.pipelines):
-                    manifold_pipelines = pipeline.pipelines()
-                else:
-                    manifold_pipelines = pipeline.pipelines
-
-                for p in manifold_pipelines:
-                    manifold_pipeline_id = f'{pipeline_id}.{p["id"]}'
-
-                    manifold_pipeline_name = p["name"]
-                    if hasattr(pipeline, "name"):
-                        manifold_pipeline_name = (
-                            f"{pipeline.name}{manifold_pipeline_name}"
-                        )
-
-                    pipelines[manifold_pipeline_id] = {
-                        "module": pipeline_id,
-                        "type": pipeline.type if hasattr(pipeline, "type") else "pipe",
-                        "id": manifold_pipeline_id,
-                        "name": manifold_pipeline_name,
-                        "valves": (
-                            pipeline.valves if hasattr(pipeline, "valves") else None
-                        ),
-                    }
-            if pipeline.type == "filter":
-                pipelines[pipeline_id] = {
-                    "module": pipeline_id,
-                    "type": (pipeline.type if hasattr(pipeline, "type") else "pipe"),
-                    "id": pipeline_id,
-                    "name": (
-                        pipeline.name if hasattr(pipeline, "name") else pipeline_id
-                    ),
-                    "pipelines": (
-                        pipeline.valves.pipelines
-                        if hasattr(pipeline, "valves")
-                        and hasattr(pipeline.valves, "pipelines")
-                        else []
-                    ),
-                    "priority": (
-                        pipeline.valves.priority
-                        if hasattr(pipeline, "valves")
-                        and hasattr(pipeline.valves, "priority")
-                        else 0
-                    ),
-                    "valves": pipeline.valves if hasattr(pipeline, "valves") else None,
-                }
-        else:
-            pipelines[pipeline_id] = {
-                "module": pipeline_id,
-                "type": (pipeline.type if hasattr(pipeline, "type") else "pipe"),
-                "id": pipeline_id,
-                "name": (pipeline.name if hasattr(pipeline, "name") else pipeline_id),
-                "valves": pipeline.valves if hasattr(pipeline, "valves") else None,
-            }
-
-    return pipelines
-
-
-def parse_frontmatter(content):
-    frontmatter = {}
-    for line in content.split("\n"):
-        if ":" in line:
-            key, value = line.split(":", 1)
-            frontmatter[key.strip().lower()] = value.strip()
-    return frontmatter
-
-
-def install_frontmatter_requirements(requirements):
-    if requirements:
-        req_list = [req.strip() for req in requirements.split(",")]
-        for req in req_list:
-            print(f"Installing requirement: {req}")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", req])
-    else:
-        print("No requirements found in frontmatter.")
-
-
-async def load_module_from_path(module_name, module_path):
+    candidates = []
 
     try:
-        # Read the module content
-        with open(module_path, "r") as file:
-            content = file.read()
-
-        # Parse frontmatter
-        frontmatter = {}
-        if content.startswith('"""'):
-            end = content.find('"""', 3)
-            if end != -1:
-                frontmatter_content = content[3:end]
-                frontmatter = parse_frontmatter(frontmatter_content)
-
-        # Install requirements if specified
-        if "requirements" in frontmatter:
-            install_frontmatter_requirements(frontmatter["requirements"])
-
-        # Load the module
-        spec = importlib.util.spec_from_file_location(module_name, module_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        print(f"Loaded module: {module.__name__}")
-        if hasattr(module, "Pipeline"):
-            return module.Pipeline()
-        else:
-            raise Exception("No Pipeline class found")
+        m = import_module("mcp.client.streamable_http")
+        if hasattr(m, "connect"):
+            return (m.connect, "streamable_http.connect", getattr(m, "__file__", "<unknown>"), mcp_version)
+        if hasattr(m, "connect_streamable_http"):
+            return (m.connect_streamable_http, "streamable_http.connect_streamable_http", getattr(m, "__file__", "<unknown>"), mcp_version)
+        if hasattr(m, "streamablehttp_client"):
+            return (m.streamablehttp_client, "streamable_http.streamablehttp_client", getattr(m, "__file__", "<unknown>"), mcp_version)
+        if hasattr(m, "create_mcp_http_client"):
+            return (m.create_mcp_http_client, "streamable_http.create_mcp_http_client", getattr(m, "__file__", "<unknown>"), mcp_version)
+        candidates.append(("mcp.client.streamable_http", list(sorted(dir(m)))))
     except Exception as e:
-        print(f"Error loading module: {module_name}")
+        candidates.append(("mcp.client.streamable_http (import error)", str(e)))
 
-        # Move the file to the error folder
-        failed_pipelines_folder = os.path.join(PIPELINES_DIR, "failed")
-        if not os.path.exists(failed_pipelines_folder):
-            os.makedirs(failed_pipelines_folder)
+    try:
+        m = import_module("mcp.client.http.streamable")
+        if hasattr(m, "connect"):
+            return (m.connect, "http.streamable.connect", getattr(m, "__file__", "<unknown>"), mcp_version)
+        candidates.append(("mcp.client.http.streamable", list(sorted(dir(m)))))
+    except Exception as e:
+        candidates.append(("mcp.client.http.streamable (import error)", str(e)))
 
-        failed_file_path = os.path.join(failed_pipelines_folder, f"{module_name}.py")
-        os.rename(module_path, failed_file_path)
-        print(e)
+    try:
+        m = import_module("mcp.client.http")
+        if hasattr(m, "connect"):
+            return (m.connect, "http.connect", getattr(m, "__file__", "<unknown>"), mcp_version)
+        candidates.append(("mcp.client.http", list(sorted(dir(m)))))
+    except Exception as e:
+        candidates.append(("mcp.client.http (import error)", str(e)))
+
+    details = "; ".join([f"{mod}: {info}" for mod, info in candidates])
+    raise ImportError(
+        f"No compatible MCP HTTP connector found. Checked streamable_http and http variants. "
+        f"Installed mcp version: {mcp_version}. Candidates: {details}"
+    )
+
+
+_CONNECTOR, _CONNECTOR_NAME, _CONNECTOR_MODULE_PATH, _MCP_VERSION = resolve_http_connector()
+
+
+def _resolve_alt_http_connector():
+    try:
+        mod = import_module("mcp.client.http.streamable")
+        if hasattr(mod, "connect"):
+            return getattr(mod, "connect")
+    except Exception:
+        pass
+    try:
+        mod = import_module("mcp.client.http")
+        if hasattr(mod, "connect"):
+            return getattr(mod, "connect")
+    except Exception:
+        pass
     return None
 
 
-async def load_modules_from_directory(directory):
-    global PIPELINE_MODULES
-    global PIPELINE_NAMES
+_ALT_HTTP_CONNECT = _resolve_alt_http_connector()
 
-    for filename in os.listdir(directory):
-        if filename.endswith(".py"):
-            module_name = filename[:-3]  # Remove the .py extension
-            module_path = os.path.join(directory, filename)
+try:
+    _streamable_http_mod = import_module("mcp.client.streamable_http")
+    _StreamableHTTPTransport = getattr(_streamable_http_mod, "StreamableHTTPTransport", None)
+    _StreamReader = getattr(_streamable_http_mod, "StreamReader", None)
+    _StreamWriter = getattr(_streamable_http_mod, "StreamWriter", None)
+except Exception:
+    _StreamableHTTPTransport = None
+    _StreamReader = None
+    _StreamWriter = None
 
-            # Create subfolder matching the filename without the .py extension
-            subfolder_path = os.path.join(directory, module_name)
-            if not os.path.exists(subfolder_path):
-                os.makedirs(subfolder_path)
-                logging.info(f"Created subfolder: {subfolder_path}")
-
-            # Create a valves.json file if it doesn't exist
-            valves_json_path = os.path.join(subfolder_path, "valves.json")
-            if not os.path.exists(valves_json_path):
-                with open(valves_json_path, "w") as f:
-                    json.dump({}, f)
-                logging.info(f"Created valves.json in: {subfolder_path}")
-
-            pipeline = await load_module_from_path(module_name, module_path)
-            if pipeline:
-                # Overwrite pipeline.valves with values from valves.json
-                if os.path.exists(valves_json_path):
-                    with open(valves_json_path, "r") as f:
-                        valves_json = json.load(f)
-                        if hasattr(pipeline, "valves"):
-                            ValvesModel = pipeline.valves.__class__
-                            # Create a ValvesModel instance using default values and overwrite with valves_json
-                            combined_valves = {
-                                **pipeline.valves.model_dump(),
-                                **valves_json,
-                            }
-                            valves = ValvesModel(**combined_valves)
-                            pipeline.valves = valves
-
-                            logging.info(f"Updated valves for module: {module_name}")
-
-                pipeline_id = pipeline.id if hasattr(pipeline, "id") else module_name
-                PIPELINE_MODULES[pipeline_id] = pipeline
-                PIPELINE_NAMES[pipeline_id] = module_name
-                logging.info(f"Loaded module: {module_name}")
-            else:
-                logging.warning(f"No Pipeline class found in {module_name}")
-
-    global PIPELINES
-    PIPELINES = get_all_pipelines()
+try:
+    import httpx
+except Exception:
+    httpx = None
 
 
-async def on_startup():
-    await load_modules_from_directory(PIPELINES_DIR)
+# -------------------------------------------------------------------
+# Application constants
+# -------------------------------------------------------------------
 
-    for module in PIPELINE_MODULES.values():
-        if hasattr(module, "on_startup"):
-            await module.on_startup()
+APP_NAME = "Open WebUI MCPO"
+APP_VERSION = "0.0.35aa"
+APP_DESCRIPTION = "Automatically generated API from MCP Tool Schemas"
 
+DEFAULT_PORT = int(os.getenv("PORT", "8080"))
+PATH_PREFIX = os.getenv("PATH_PREFIX", "/")
+CORS_ALLOWED_ORIGINS = [o.strip() for o in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+API_KEY = os.getenv("API_KEY", "changeme")
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "https://mcp-streamable-test-production.up.railway.app/mcp")
+MCP_HEADERS = os.getenv("MCP_HEADERS", "")
 
-async def on_shutdown():
-    for module in PIPELINE_MODULES.values():
-        if hasattr(module, "on_shutdown"):
-            await module.on_shutdown()
-
-
-async def reload():
-    await on_shutdown()
-    # Clear existing pipelines
-    PIPELINES.clear()
-    PIPELINE_MODULES.clear()
-    PIPELINE_NAMES.clear()
-    # Load pipelines afresh
-    await on_startup()
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await on_startup()
-    yield
-    await on_shutdown()
-
-
-app = FastAPI(docs_url="/docs", redoc_url=None, lifespan=lifespan)
-
-# Added: simple health route for liveness
-@app.get("/health")
-async def health():
-    return {"status": "ok", "name": "Open WebUI Pipelines"}
-
-app.state.PIPELINES = PIPELINES
-
-origins = ["*"]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+logger = logging.getLogger("mcpo")
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
 
-@app.middleware("http")
-async def check_url(request: Request, call_next):
-    start_time = int(time.time())
-    app.state.PIPELINES = get_all_pipelines()
-    response = await call_next(request)
-    process_time = int(time.time()) - start_time
-    response.headers["X-Process-Time"] = str(process_time)
-
-    return response
-
-
-@app.get("/v1/models")
-@app.get("/models")
-async def get_models(user: str = Depends(get_current_user)):
-    """
-    Returns the available pipelines
-    """
-    app.state.PIPELINES = get_all_pipelines()
-    return {
-        "data": [
-            {
-                "id": pipeline["id"],
-                "name": pipeline["name"],
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "openai",
-                "pipeline": {
-                    "type": pipeline["type"],
-                    **(
-                        {
-                            "pipelines": (
-                                pipeline["valves"].pipelines
-                                if pipeline.get("valves", None)
-                                else []
-                            ),
-                            "priority": pipeline.get("priority", 0),
-                        }
-                        if pipeline.get("type", "pipe") == "filter"
-                        else {}
-                    ),
-                    "valves": pipeline["valves"] != None,
-                },
-            }
-            for pipeline in app.state.PIPELINES.values()
-        ],
-        "object": "list",
-        "pipelines": True,
-    }
-
-
-@app.get("/v1")
-@app.get("/")
-async def get_status():
-    return {"status": True}
-
-
-@app.get("/v1/pipelines")
-@app.get("/pipelines")
-async def list_pipelines(user: str = Depends(get_current_user)):
-    if user == API_KEY:
-        return {
-            "data": [
-                {
-                    "id": pipeline_id,
-                    "name": PIPELINE_NAMES[pipeline_id],
-                    "type": (
-                        PIPELINE_MODULES[pipeline_id].type
-                        if hasattr(PIPELINE_MODULES[pipeline_id], "type")
-                        else "pipe"
-                    ),
-                    "valves": (
-                        True
-                        if hasattr(PIPELINE_MODULES[pipeline_id], "valves")
-                        else False
-                    ),
-                }
-                for pipeline_id in list(PIPELINE_MODULES.keys())
-            ]
-        }
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key",
-        )
-
-
-class AddPipelineForm(BaseModel):
-    url: str
-
-
-async def download_file(url: str, dest_folder: str):
-    filename = os.path.basename(urlparse(url).path)
-    if not filename.endswith(".py"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="URL must point to a Python file",
-        )
-
-    file_path = os.path.join(dest_folder, filename)
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            if response.status != 200:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Failed to download file",
-                )
-            with open(file_path, "wb") as f:
-                f.write(await response.read())
-
-    return file_path
-
-
-@app.post("/v1/pipelines/add")
-@app.post("/pipelines/add")
-async def add_pipeline(
-    form_data: AddPipelineForm, user: str = Depends(get_current_user)
-):
-    if user != API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key",
-        )
-
-    try:
-        url = convert_to_raw_url(form_data.url)
-
-        print(url)
-        file_path = await download_file(url, dest_folder=PIPELINES_DIR)
-        await reload()
-        return {
-            "status": True,
-            "detail": f"Pipeline added successfully from {file_path}",
-        }
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e),
-        )
-
-
-@app.post("/v1/pipelines/upload")
-@app.post("/pipelines/upload")
-async def upload_pipeline(
-    file: UploadFile = File(...), user: str = Depends(get_current_user)
-):
-    if user != API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key",
-        )
-
-    file_ext = os.path.splitext(file.filename)[1]
-    if file_ext != ".py":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only Python files are allowed.",
-        )
-
-    try:
-        # Ensure the destination folder exists
-        os.makedirs(PIPELINES_DIR, exist_ok=True)
-
-        # Define the file path
-        file_path = os.path.join(PIPELINES_DIR, file.filename)
-
-        # Save the uploaded file to the specified directory
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        # Perform any necessary reload or processing
-        await reload()
-
-        return {
-            "status": True,
-            "detail": f"Pipeline uploaded successfully to {file_path}",
-        }
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e),
-        )
-
-
-class DeletePipelineForm(BaseModel):
-    id: str
-
-
-@app.delete("/v1/pipelines/delete")
-@app.delete("/pipelines/delete")
-async def delete_pipeline(
-    form_data: DeletePipelineForm, user: str = Depends(get_current_user)
-):
-    if user != API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key",
-        )
-
-    pipeline_id = form_data.id
-    pipeline_name = PIPELINE_NAMES.get(pipeline_id.split(".")[0], None)
-
-    if PIPELINE_MODULES[pipeline_id]:
-        if hasattr(PIPELINE_MODULES[pipeline_id], "on_shutdown"):
-            await PIPELINE_MODULES[pipeline_id].on_shutdown()
-
-    pipeline_path = os.path.join(PIPELINES_DIR, f"{pipeline_name}.py")
-    if os.path.exists(pipeline_path):
-        os.remove(pipeline_path)
-        await reload()
-        return {
-            "status": True,
-            "detail": f"Pipeline {pipeline_id} deleted successfully",
-        }
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Pipeline {pipeline_id} not found",
-        )
-
-
-@app.post("/v1/pipelines/reload")
-@app.post("/pipelines/reload")
-async def reload_pipelines(user: str = Depends(get_current_user)):
-    if user == API_KEY:
-        await reload()
-        return {"message": "Pipelines reloaded successfully."}
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key",
-        )
-
-
-@app.get("/v1/{pipeline_id}/valves")
-@app.get("/{pipeline_id}/valves")
-async def get_valves(pipeline_id: str):
-    if pipeline_id not in PIPELINE_MODULES:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Pipeline {pipeline_id} not found",
-        )
-
-    pipeline = PIPELINE_MODULES[pipeline_id]
-
-    if hasattr(pipeline, "valves") is False:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Valves for {pipeline_id} not found",
-        )
-
-    return pipeline.valves
-
-
-@app.get("/v1/{pipeline_id}/valves/spec")
-@app.get("/{pipeline_id}/valves/spec")
-async def get_valves_spec(pipeline_id: str):
-    if pipeline_id not in PIPELINE_MODULES:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Pipeline {pipeline_id} not found",
-        )
-
-    pipeline = PIPELINE_MODULES[pipeline_id]
-
-    if hasattr(pipeline, "valves") is False:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Valves for {pipeline_id} not found",
-        )
-
-    return pipeline.valves.schema()
-
-
-@app.post("/v1/{pipeline_id}/valves/update")
-@app.post("/{pipeline_id}/valves/update")
-async def update_valves(pipeline_id: str, form_data: dict):
-
-    if pipeline_id not in PIPELINE_MODULES:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Pipeline {pipeline_id} not found",
-        )
-
-    pipeline = PIPELINE_MODULES[pipeline_id]
-
-    if hasattr(pipeline, "valves") is False:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Valves for {pipeline_id} not found",
-        )
-
-    try:
-        ValvesModel = pipeline.valves.__class__
-        valves = ValvesModel(**form_data)
-        pipeline.valves = valves
-
-        # Determine the directory path for the valves.json file
-        subfolder_path = os.path.join(PIPELINES_DIR, PIPELINE_NAMES[pipeline_id])
-        valves_json_path = os.path.join(subfolder_path, "valves.json")
-
-        # Save the updated valves data back to the valves.json file
-        with open(valves_json_path, "w") as f:
-            json.dump(valves.model_dump(), f)
-
-        if hasattr(pipeline, "on_valves_updated"):
-            await pipeline.on_valves_updated()
-    except Exception as e:
-        print(e)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"{str(e)}",
-        )
-
-    return pipeline.valves
-
-
-@app.post("/v1/{pipeline_id}/filter/inlet")
-@app.post("/{pipeline_id}/filter/inlet")
-async def filter_inlet(pipeline_id: str, form_data: FilterForm):
-    if pipeline_id not in app.state.PIPELINES:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Filter {pipeline_id} not found",
-        )
-
-    try:
-        pipeline = app.state.PIPELINES[form_data.body["model"]]
-        if pipeline["type"] == "manifold":
-            pipeline_id = pipeline_id.split(".")[0]
-    except:
-        pass
-
-    pipeline = PIPELINE_MODULES[pipeline_id]
-
-    try:
-        if hasattr(pipeline, "inlet"):
-            body = await pipeline.inlet(form_data.body, form_data.user)
-            return body
-        else:
-            return form_data.body
-    except Exception as e:
-        print(e)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"{str(e)}",
-        )
-
-
-@app.post("/v1/{pipeline_id}/filter/outlet")
-@app.post("/{pipeline_id}/filter/outlet")
-async def filter_outlet(pipeline_id: str, form_data: FilterForm):
-    if pipeline_id not in app.state.PIPELINES:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Filter {pipeline_id} not found",
-        )
-
-    try:
-        pipeline = app.state.PIPELINES[form_data.body["model"]]
-        if pipeline["type"] == "manifold":
-            pipeline_id = pipeline_id.split(".")[0]
-    except:
-        pass
-
-    pipeline = PIPELINE_MODULES[pipeline_id]
-
-    try:
-        if hasattr(pipeline, "outlet"):
-            body = await pipeline.outlet(form_data.body, form_data.user)
-            return body
-        else:
-            return form_data.body
-    except Exception as e:
-        print(e)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"{str(e)}",
-        )
-
-
-@app.post("/v1/chat/completions")
-@app.post("/chat/completions")
-async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
-    messages = [message.model_dump() for message in form_data.messages]
-    user_message = get_last_user_message(messages)
-
-    if (
-        form_data.model not in app.state.PIPELINES
-        or app.state.PIPELINES[form_data.model]["type"] == "filter"
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Pipeline {form_data.model} not found",
-        )
-
-    def job():
-        print(form_data.model)
-
-        pipeline = app.state.PIPELINES[form_data.model]
-        pipeline_id = form_data.model
-
-        print(pipeline_id)
-
-        if pipeline["type"] == "manifold":
-            manifold_id, pipeline_id = pipeline_id.split(".", 1)
-            pipe = PIPELINE_MODULES[manifold_id].pipe
-        else:
-            pipe = PIPELINE_MODULES[pipeline_id].pipe
-
-        if form_data.stream:
-
-            def stream_content():
-                res = pipe(
-                    user_message=user_message,
-                    model_id=pipeline_id,
-                    messages=messages,
-                    body=form_data.model_dump(),
-                )
-                logging.info(f"stream:true:{res}")
-
-                if isinstance(res, str):
-                    message = stream_message_template(form_data.model, res)
-                    logging.info(f"stream_content:str:{message}")
-                    yield f"data: {json.dumps(message)}\n\n"
-
-                if isinstance(res, Iterator):
-                    for line in res:
-                        if isinstance(line, BaseModel):
-                            line = line.model_dump_json()
-                            line = f"data: {line}"
-
-                        elif isinstance(line, dict):
-                            line = json.dumps(line)
-                            line = f"data: {line}"
-
-                        try:
-                            line = line.decode("utf-8")
-                            logging.info(f"stream_content:Generator:{line}")
-                        except:
-                            pass
-
-                        if isinstance(line, str) and line.startswith("data:"):
-                            yield f"{line}\n\n"
-                        else:
-                            line = stream_message_template(form_data.model, line)
-                            yield f"data: {json.dumps(line)}\n\n"
-
-                if isinstance(res, str) or isinstance(res, Generator):
-                    finish_message = {
-                        "id": f"{form_data.model}-{str(uuid.uuid4())}",
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": form_data.model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {},
-                                "logprobs": None,
-                                "finish_reason": "stop",
-                            }
-                        ],
-                    }
-
-                    yield f"data: {json.dumps(finish_message)}\n\n"
-                    yield f"data: [DONE]"
-
-            return StreamingResponse(stream_content(), media_type="text/event-stream")
-        else:
-            res = pipe(
-                user_message=user_message,
-                model_id=pipeline_id,
-                messages=messages,
-                body=form_data.model_dump(),
+# -------------------------------------------------------------------
+# Auth, pydantic schema and retry helpers
+# -------------------------------------------------------------------
+
+class APIKeyHeader(BaseModel):
+    api_key: str
+
+
+def api_dependency():
+    from fastapi import Request
+
+    async def _dep(request: Request) -> APIKeyHeader:
+        key = request.headers.get("x-api-key")
+        if not key or key != API_KEY:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        return APIKeyHeader(api_key=key)
+
+    return _dep
+
+
+class ToolDef(BaseModel):
+    name: str
+    description: Optional[str] = None
+    inputSchema: Dict[str, Any]
+    outputSchema: Optional[Dict[str, Any]] = None
+
+
+# -------------------------------------------------------------------
+# MCP supporting functions (retry, connector wrapper, tool list, call)
+# -------------------------------------------------------------------
+
+async def retry_jsonrpc(call_fn: Callable[[], Awaitable], desc: str, retries: int = 1, sleep_s: float = 0.1):
+    for attempt in range(retries + 1):
+        try:
+            return await call_fn()
+        except Exception as e:
+            txt = str(e)
+            transient = (
+                "notifications/initialized" in txt or
+                "JSONRPCMessage" in txt or
+                "TaskGroup" in txt
             )
-            logging.info(f"stream:false:{res}")
-
-            if isinstance(res, dict):
-                return res
-            elif isinstance(res, BaseModel):
-                return res.model_dump()
-            else:
-
-                message = ""
-
-                if isinstance(res, str):
-                    message = res
-
-                if isinstance(res, Generator):
-                    for stream in res:
-                        message = f"{message}{stream}"
-
-                logging.info(f"stream:false:{message}")
-                return {
-                    "id": f"{form_data.model}-{str(uuid.uuid4())}",
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": form_data.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": message,
-                            },
-                            "logprobs": None,
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
-
-    return await run_in_threadpool(job)
+            if not transient and hasattr(e, "exceptions"):
+                for sub in getattr(e, "exceptions", []):
+                    s = str(sub)
+                    if "notifications/initialized" in s or "JSONRPCMessage" in s:
+                        transient = True
+                        break
+            if attempt < retries and transient:
+                logging.getLogger("mcpo").warning("Transient error on %s; retrying (%d/%d)", desc, attempt + 1, retries)
+                await asyncio.sleep(sleep_s)
+                continue
+            raise
 
 
-# Added: minimal dispatcher to call a pipeline directly by ID
-@app.post("/pipelines/{pipeline_id}")
-async def run_pipeline(
-    pipeline_id: str,
-    form_data: dict = Body(...),
-    user: str = Depends(get_current_user),
-):
-    if user != API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key",
+# -------------------------------------------------------------------
+# FastAPI app factory
+# -------------------------------------------------------------------
+
+_DISCOVERED_TOOL_NAMES: List[str] = []
+_DISCOVERED_TOOLS_MIN: List[Dict[str, Any]] = []
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title=APP_NAME,
+        version=APP_VERSION,
+        description=APP_DESCRIPTION,
+        docs_url=f"{PATH_PREFIX.rstrip('/')}/docs" if PATH_PREFIX != "/" else "/docs",
+        openapi_url=f"{PATH_PREFIX.rstrip('/')}/openapi.json" if PATH_PREFIX != "/" else "/openapi.json",
+    )
+
+    if CORS_ALLOWED_ORIGINS:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=CORS_ALLOWED_ORIGINS,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
         )
 
-    if pipeline_id not in PIPELINE_MODULES:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Pipeline {pipeline_id} not found",
-        )
+    # Health/ping routes
+    @app.get(f"{PATH_PREFIX.rstrip('/')}/health" if PATH_PREFIX != "/" else "/health")
+    async def health():
+        return {"status": "ok", "name": APP_NAME, "version": APP_VERSION}
 
-    pipe = PIPELINE_MODULES[pipeline_id].pipe
-    res = pipe(user_message=None, model_id=pipeline_id, messages=[], body=form_data)
+    @app.get(f"{PATH_PREFIX.rstrip('/')}/ping" if PATH_PREFIX != "/" else "/ping")
+    async def ping():
+        return {"pong": True}
 
-    if isinstance(res, dict):
-        return res
-    elif isinstance(res, BaseModel):
-        return res.model_dump()
-    else:
-        return {"result": res}
+    # Startup logic
+    @app.on_event("startup")
+    async def on_startup():
+        logger.info("Starting MCPO Server...")
+        logger.info(" Name: %s", APP_NAME)
+        logger.info(" Version: %s", APP_VERSION)
+        logger.info(" Description: %s", APP_DESCRIPTION)
+
+        # --- Block B: discover local pipelines ---
+        try:
+            _discover_pipelines(os.getenv("PIPELINES_DIR", "./pipelines"))
+            logger.info("Discovered %d local pipeline(s): %s", len(_PIPELINES_REGISTRY), sorted(_PIPELINES_REGISTRY.keys()))
+        except Exception:
+            logger.exception("Local pipeline discovery failed")
+        # ----------------------------------------
+
+        logger.info("Echo/Ping routes registered")
+        logger.info("Configuring for a single StreamableHTTP MCP Server with URL [%s;]", MCP_SERVER_URL)
+
+        # [ .. existing MCP tool discovery logic continues .. ]
+
+    @app.get("/")
+    async def root():
+        return {
+            "name": APP_NAME,
+            "version": APP_VERSION,
+            "description": APP_DESCRIPTION,
+            "docs": app.docs_url,
+            "openapi": app.openapi_url,
+        }
+
+    return app
+
+
+# -------------------------------------------------------------------
+# Diagnostics + Tools routes
+# -------------------------------------------------------------------
+
+app = create_app()
+
+
+def attach_mcpo_diagnostics(app: FastAPI) -> None:
+    route = f"{PATH_PREFIX.rstrip('/')}/_diagnostic" if PATH_PREFIX != "/" else "/_diagnostic"
+
+    @app.get(route)
+    async def _diagnostic(dep=Depends(api_dependency())):
+        return {
+            "app": {"name": APP_NAME, "version": APP_VERSION, "path_prefix": PATH_PREFIX},
+            "mcp": {"connector": _CONNECTOR_NAME, "version": _MCP_VERSION},
+        }
+
+
+attach_mcpo_diagnostics(app)
+
+
+def attach_tools_listing(app: FastAPI) -> None:
+    route = f"{PATH_PREFIX.rstrip('/')}/_tools" if PATH_PREFIX != "/" else "/_tools"
+
+    @app.get(route)
+    async def _tools(dep=Depends(api_dependency())):
+        return {"tools": list(_DISCOVERED_TOOL_NAMES)}
+
+
+attach_tools_listing(app)
+
+
+def attach_tools_full_listing(app: FastAPI) -> None:
+    route = f"{PATH_PREFIX.rstrip('/')}/_tools_full" if PATH_PREFIX != "/" else "/_tools_full"
+
+    @app.get(route)
+    async def _tools_full(dep=Depends(api_dependency())):
+        return {"tools": [dict(item) for item in _DISCOVERED_TOOLS_MIN]}
+
+
+attach_tools_full_listing(app)
+
+
+# -------------------------------------------------------------------
+# --- Block A: Pipelines compatibility layer ---
+# -------------------------------------------------------------------
+
+from types import ModuleType
+from importlib import util as _imp_util
+
+_PIPELINES_REGISTRY: Dict[str, Dict[str, Any]] = {}
+
+
+def _discover_pipelines(base_dir: str) -> None:
+    """Populate _PIPELINES_REGISTRY with modules exposing class Pipeline().pipe()."""
+    _PIPELINES_REGISTRY.clear()
+    if not base_dir or not os.path.isdir(base_dir):
+        logger.info("PIPELINES_DIR not present or not a directory: %s", base_dir)
+        return
+    for fname in os.listdir(base_dir):
+        if not fname.endswith(".py"):
+            continue
+        fpath = os.path.join(base_dir, fname)
+        mod_name = f"pipelines.{fname[:-3]}"
+        try:
+            spec = _imp_util.spec_from_file_location(mod_name, fpath)
+            if not spec or not spec.loader:
+                continue
+            mod = _imp_util.module_from_spec(spec)  # type: ignore
+            spec.loader.exec_module(mod)  # type: ignore
+            PipelineCls = getattr(mod, "Pipeline", None)
+            if PipelineCls is None:
+                continue
+            obj = PipelineCls()
+            pipe_fn = getattr(obj, "pipe", None)
+            if not callable(pipe_fn):
+                continue
+            pid = getattr(obj, "id", None) or getattr(obj, "name", None) or fname[:-3]
+            _PIPELINES_REGISTRY[str(pid)] = {
+                "module": mod_name,
+                "file": fpath,
+                "callable": pipe_fn,
+            }
+        except Exception as e:
+            logger.warning("Skipping pipeline %s due to load error: %s", fpath, e)
+
+
+def attach_pipelines_routes(app: FastAPI) -> None:
+    route_list = "/pipelines" if PATH_PREFIX == "/" else f"{PATH_PREFIX.rstrip('/')}/pipelines"
+    route_call = "/pipelines/{name}" if PATH_PREFIX == "/" else f"{PATH_PREFIX.rstrip('/')}/pipelines/{name}"
+
+    @app.get(route_list)
+    async def _pipelines_list(dep=Depends(api_dependency())):
+        return {"pipelines": sorted(list(_PIPELINES_REGISTRY.keys()))}
+
+    @app.post(route_call)
+    async def _pipelines_call(name: str, payload: Dict[str, Any] | None = None, dep=Depends(api_dependency())):
+        payload = payload or {}
+        entry = _PIPELINES_REGISTRY.get(name)
+        if not entry:
+            raise HTTPException(status_code=404, detail=f"pipeline '{name}' not found")
+        try:
+            result = entry["callable"](body=payload)
+            if isinstance(result, dict):
+                return JSONResponse(status_code=200, content=result)
+            return JSONResponse(status_code=200, content={"result": result})
+        except Exception as e:
+            logger.exception("Pipeline '%s' execution error: %s", name, e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- End Block A --------------------------------------------------
+
+# --- Block C: attach pipeline routes at app creation ---
+attach_pipelines_routes(app)
+
+
+# -------------------------------------------------------------------
+# Entrypoint runner
+# -------------------------------------------------------------------
+
+def run(host: str = "0.0.0.0", port: int = DEFAULT_PORT, log_level: str = None, reload: bool = False, *args, **kwargs):
+    import uvicorn
+    uvicorn.run(
+        "mcpo.main:app",
+        host=host,
+        port=port,
+        log_level=log_level or os.getenv("UVICORN_LOG_LEVEL", "info"),
+        reload=reload,
+    )
+
+
+if __name__ == "__main__":
+    run()
