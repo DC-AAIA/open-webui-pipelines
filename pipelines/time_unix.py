@@ -1,9 +1,27 @@
 """
-name: Time Unix Pipeline
-id: time_unix
-type: pipe
-description: Returns current time in epoch seconds and ISO8601Z.
+Pipeline: time_unix
+Purpose:
+  Return machine-friendly epoch time for precise calculations and scheduling.
+
+Inputs:
+  - none
+
+Outputs:
+  - epoch_seconds: int (seconds since 1970-01-01T00:00:00Z)
+  - epoch_millis: int (milliseconds since 1970-01-01T00:00:00Z)
+
+Usage Guidance:
+  - Prefer this for timers, retries, TTLs, scheduling, cache keys, and comparisons.
+  - For human-readable displays/logs, use time.
+
+Example curl:
+  curl -sS "$PIPELINES_BASE_URL/pipelines/time_unix" | jq .
+
+Notes:
+  - Stable across locales/time zones; ideal for cross-service time math.
+  - See also: time (human-readable) and time_info (aggregated convenience).
 """
+
 import time
 from datetime import datetime, timezone
 
