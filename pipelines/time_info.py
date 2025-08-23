@@ -30,12 +30,13 @@ Notes:
 from datetime import datetime, timezone
 import time as _time
 
-class TimeInfo:
-    name = "time_info"
+class Pipeline:
+    id = "time_info"
+    name = "time_info"  # optional; id is sufficient
     description = "Aggregated current time in human-readable and Unix epoch formats."
-    methods = ["GET"]
+    methods = ["GET"]  # optional; not used by the loader but harmless
 
-    def handle(self, request=None):
+    def pipe(self, body: dict | None = None):
         # Single snapshot for consistency
         now_utc = datetime.now(timezone.utc)
         iso = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
